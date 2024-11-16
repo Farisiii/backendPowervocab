@@ -7,9 +7,10 @@ import jwt
 import os
 from dotenv import load_dotenv
 from functools import wraps
+import secrets
 import re
-import os
-
+import psutil
+import time
 
 # Load environment variables
 load_dotenv()
@@ -20,7 +21,7 @@ app = Flask(__name__)
 # Configure CORS with specific origins
 CORS(app, resources={
     r"/api/*": {
-        "origins": ["http://localhost:5173"],
+        "origins": ["https://powervocab.netlify.app"],
         "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
         "allow_headers": ["Content-Type", "Authorization"],
         "supports_credentials": True
