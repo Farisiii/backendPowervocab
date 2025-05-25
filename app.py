@@ -7,10 +7,8 @@ import jwt
 import os
 from dotenv import load_dotenv
 from functools import wraps
-import secrets
 import re
-import psutil
-import time
+
 
 # Load environment variables
 load_dotenv()
@@ -21,7 +19,7 @@ app = Flask(__name__)
 # Configure CORS with specific origins
 CORS(app, resources={
     r"/api/*": {
-        "origins": ["https://powervocab.netlify.app"],
+        "origins": ["*"],
         "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
         "allow_headers": ["Content-Type", "Authorization"],
         "supports_credentials": True
@@ -52,7 +50,7 @@ db = SQLAlchemy(app)
 
 # Models
 class User(db.Model):
-    __tablename__ = 'users'  # Added table name
+    __tablename__ = 'users'
     id = db.Column(db.Integer, primary_key=True)
     email = db.Column(db.String(120), unique=True, nullable=False)
     full_name = db.Column(db.String(100), nullable=False)
@@ -68,12 +66,12 @@ class User(db.Model):
 class LearningCard(db.Model):
     __tablename__ = 'learning_cards'
     id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)  # Updated foreign key reference
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
     title = db.Column(db.String(200), nullable=False)
     progress = db.Column(db.Integer, default=0)
     target_days = db.Column(db.Integer, nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    word_pairs = db.relationship('WordPair', backref='card', lazy=True, cascade='all, delete-orphan')
+    word_pairs = db.relationship('WordPair', backref='card', lazy=True, cascade='all, delete-orphan', order_by='WordPair.order_index')
 
 class WordPair(db.Model):
     __tablename__ = 'word_pairs'
@@ -82,6 +80,9 @@ class WordPair(db.Model):
     english = db.Column(db.String(100), nullable=False)
     indonesian = db.Column(db.String(100), nullable=False)
     is_learned = db.Column(db.Boolean, default=False)
+    order_index = db.Column(db.Integer, nullable=False, default=0)  # New field for consistent ordering
+    last_studied = db.Column(db.DateTime, nullable=True)  # Track when word was last studied
+    study_count = db.Column(db.Integer, default=0)  # Track how many times studied
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
 # JWT Authentication decorator
@@ -102,7 +103,6 @@ def token_required(f):
 
         try:
             data = jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
-            # Updated: Using db.session.get() instead of Query.get()
             current_user = db.session.get(User, data['user_id'])
             
             if not current_user:
@@ -192,7 +192,6 @@ def login():
         if not email or not password:
             return jsonify({'error': 'Email and password are required'}), 400
 
-        # Updated: Using db.session.execute() with select()
         result = db.session.execute(db.select(User).filter_by(email=email)).first()
         user = result[0] if result else None
 
@@ -220,7 +219,6 @@ def login():
 @token_required
 def get_cards(current_user):
     try:
-        # Updated: Using db.session.execute() with select()
         result = db.session.execute(
             db.select(LearningCard).filter_by(user_id=current_user.id)
         ).scalars()
@@ -232,10 +230,16 @@ def get_cards(current_user):
             'progress': card.progress,
             'targetDays': card.target_days,
             'totalWords': len(card.word_pairs),
+            'learnedWords': len([pair for pair in card.word_pairs if pair.is_learned]),
             'wordPairs': [{
+                'id': pair.id,
                 'english': pair.english,
-                'indonesian': pair.indonesian
-            } for pair in card.word_pairs]
+                'indonesian': pair.indonesian,
+                'isLearned': pair.is_learned,
+                'orderIndex': pair.order_index,
+                'studyCount': pair.study_count,
+                'lastStudied': pair.last_studied.isoformat() if pair.last_studied else None
+            } for pair in sorted(card.word_pairs, key=lambda x: x.order_index)]
         } for card in cards]), 200
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -251,14 +255,15 @@ def create_card(current_user):
 
         new_card = LearningCard(
             title=data['title'],
-            progress=0,  # Always start with 0 progress for new cards
+            progress=0,
             target_days=int(data['targetDays']),
             user_id=current_user.id
         )
         db.session.add(new_card)
         db.session.flush()
         
-        for pair in data['wordPairs']:
+        # Add word pairs with order index to maintain consistent ordering
+        for index, pair in enumerate(data['wordPairs']):
             if not pair.get('english') or not pair.get('indonesian'):
                 db.session.rollback()
                 return jsonify({'error': 'Invalid word pair data'}), 400
@@ -266,19 +271,34 @@ def create_card(current_user):
             word_pair = WordPair(
                 card_id=new_card.id,
                 english=pair['english'],
-                indonesian=pair['indonesian']
+                indonesian=pair['indonesian'],
+                order_index=index  # Set order index
             )
             db.session.add(word_pair)
         
         db.session.commit()
+        
+        # Get the created word pairs with their IDs
+        created_pairs = db.session.execute(
+            db.select(WordPair).filter_by(card_id=new_card.id).order_by(WordPair.order_index)
+        ).scalars().all()
         
         return jsonify({
             'id': new_card.id,
             'title': new_card.title,
             'progress': new_card.progress,
             'targetDays': new_card.target_days,
-            'totalWords': len(data['wordPairs']),
-            'wordPairs': data['wordPairs']
+            'totalWords': len(created_pairs),
+            'learnedWords': 0,
+            'wordPairs': [{
+                'id': pair.id,
+                'english': pair.english,
+                'indonesian': pair.indonesian,
+                'isLearned': pair.is_learned,
+                'orderIndex': pair.order_index,
+                'studyCount': pair.study_count,
+                'lastStudied': None
+            } for pair in created_pairs]
         }), 201
     except Exception as e:
         db.session.rollback()
@@ -301,38 +321,15 @@ def update_card(current_user, card_id):
         if not data.get('title') or not data.get('targetDays') or not data.get('wordPairs'):
             return jsonify({'error': 'Missing required fields'}), 400
             
-        # Create a map of existing word pairs with their learned status
-        existing_pairs = {
-            f"{wp.english.lower()}:{wp.indonesian.lower()}": wp.is_learned 
-            for wp in card.word_pairs
-        }
-        
-        # Initialize learned words counter
-        learned_words_count = 0
-        
-        # Prepare new word pairs while preserving learned status
-        new_pairs = []
-        for pair in data['wordPairs']:
-            if not pair.get('english') or not pair.get('indonesian'):
-                db.session.rollback()
-                return jsonify({'error': 'Invalid word pair data'}), 400
-            
-            # Create a key for the current pair
-            pair_key = f"{pair['english'].lower()}:{pair['indonesian'].lower()}"
-            
-            # Check if this pair existed before and was learned
-            is_learned = existing_pairs.get(pair_key, False)
-            
-            # If the pair was learned, increment counter
-            if is_learned:
-                learned_words_count += 1
-            
-            new_pairs.append(WordPair(
-                card_id=card_id,
-                english=pair['english'],
-                indonesian=pair['indonesian'],
-                is_learned=is_learned
-            ))
+        # Create a map of existing word pairs with their learned status and study data
+        existing_pairs_map = {}
+        for wp in card.word_pairs:
+            key = f"{wp.english.lower().strip()}:{wp.indonesian.lower().strip()}"
+            existing_pairs_map[key] = {
+                'is_learned': wp.is_learned,
+                'study_count': wp.study_count,
+                'last_studied': wp.last_studied
+            }
         
         # Update basic card info
         card.title = data['title']
@@ -341,9 +338,37 @@ def update_card(current_user, card_id):
         # Remove all existing word pairs
         db.session.execute(db.delete(WordPair).filter_by(card_id=card_id))
         
-        # Add new word pairs
-        for word_pair in new_pairs:
+        # Add new word pairs while preserving learned status and study data
+        learned_words_count = 0
+        new_pairs = []
+        
+        for index, pair in enumerate(data['wordPairs']):
+            if not pair.get('english') or not pair.get('indonesian'):
+                db.session.rollback()
+                return jsonify({'error': 'Invalid word pair data'}), 400
+            
+            # Create key for matching with existing data
+            pair_key = f"{pair['english'].lower().strip()}:{pair['indonesian'].lower().strip()}"
+            existing_data = existing_pairs_map.get(pair_key, {})
+            
+            is_learned = existing_data.get('is_learned', False)
+            study_count = existing_data.get('study_count', 0)
+            last_studied = existing_data.get('last_studied', None)
+            
+            if is_learned:
+                learned_words_count += 1
+            
+            word_pair = WordPair(
+                card_id=card_id,
+                english=pair['english'],
+                indonesian=pair['indonesian'],
+                is_learned=is_learned,
+                study_count=study_count,
+                last_studied=last_studied,
+                order_index=index  # Maintain order
+            )
             db.session.add(word_pair)
+            new_pairs.append(word_pair)
         
         # Calculate new progress percentage
         total_words = len(new_pairs)
@@ -352,10 +377,13 @@ def update_card(current_user, card_id):
         else:
             new_progress = 0
             
-        # Update card progress
         card.progress = new_progress
-        
         db.session.commit()
+        
+        # Get the updated word pairs with their new IDs
+        updated_pairs = db.session.execute(
+            db.select(WordPair).filter_by(card_id=card_id).order_by(WordPair.order_index)
+        ).scalars().all()
         
         return jsonify({
             'id': card.id,
@@ -363,23 +391,26 @@ def update_card(current_user, card_id):
             'progress': card.progress,
             'targetDays': card.target_days,
             'totalWords': total_words,
+            'learnedWords': learned_words_count,
             'wordPairs': [{
+                'id': pair.id,
                 'english': pair.english,
                 'indonesian': pair.indonesian,
-                'isLearned': pair.is_learned
-            } for pair in new_pairs]
+                'isLearned': pair.is_learned,
+                'orderIndex': pair.order_index,
+                'studyCount': pair.study_count,
+                'lastStudied': pair.last_studied.isoformat() if pair.last_studied else None
+            } for pair in updated_pairs]
         }), 200
         
     except Exception as e:
         db.session.rollback()
         return jsonify({'error': str(e)}), 500
-    
         
 @app.route('/api/cards/<int:card_id>', methods=['DELETE'])
 @token_required
 def delete_card(current_user, card_id):
     try:
-        # Updated: Using db.session.execute() with select()
         result = db.session.execute(
             db.select(LearningCard).filter_by(id=card_id, user_id=current_user.id)
         ).first()
@@ -395,8 +426,6 @@ def delete_card(current_user, card_id):
     except Exception as e:
         db.session.rollback()
         return jsonify({'error': str(e)}), 500
-
-# Pada Flask backend (app.py), perlu memodifikasi fungsi update_progress:
 
 @app.route('/api/cards/<int:card_id>/progress', methods=['PUT'])
 @token_required
@@ -414,27 +443,34 @@ def update_progress(current_user, card_id):
         if 'wordPairs' not in data:
             return jsonify({'error': 'Word pairs data is required'}), 400
             
-        # Get all existing word pairs for this card
+        # Get all existing word pairs for this card, ordered by order_index
         existing_pairs = db.session.execute(
-            db.select(WordPair).filter_by(card_id=card_id)
+            db.select(WordPair).filter_by(card_id=card_id).order_by(WordPair.order_index)
         ).scalars().all()
         
-        # Create a dictionary to map word pairs to their objects
-        pair_map = {
-            f"{pair.english}:{pair.indonesian}": pair 
-            for pair in existing_pairs
-        }
+        # Create a dictionary to map word pairs by their ID
+        pair_map = {pair.id: pair for pair in existing_pairs}
         
         # Update learned status for each word pair
         learned_count = 0
-        total_count = len(existing_pairs)  # Use total number of existing pairs
+        total_count = len(existing_pairs)
+        current_time = datetime.utcnow()
         
         for pair_data in data['wordPairs']:
-            pair_key = f"{pair_data['english']}:{pair_data['indonesian']}"
-            word_pair = pair_map.get(pair_key)
+            pair_id = pair_data.get('id')
+            word_pair = pair_map.get(pair_id)
             
             if word_pair:
-                word_pair.is_learned = pair_data.get('isLearned', False)
+                old_status = word_pair.is_learned
+                new_status = pair_data.get('isLearned', False)
+                
+                word_pair.is_learned = new_status
+                
+                # Update study tracking if status changed
+                if old_status != new_status:
+                    word_pair.study_count += 1
+                    word_pair.last_studied = current_time
+                
                 if word_pair.is_learned:
                     learned_count += 1
         
@@ -456,7 +492,6 @@ def update_progress(current_user, card_id):
     except Exception as e:
         db.session.rollback()
         return jsonify({'error': str(e)}), 500
-    
 
 @app.route('/api/cards/<int:card_id>/reset-progress', methods=['PUT'])
 @token_required
@@ -470,25 +505,44 @@ def reset_progress(current_user, card_id):
         if not card:
             return jsonify({'error': 'Card not found'}), 404
             
-        # Reset progress for all word pairs
+        # Reset progress for all word pairs but keep order
         word_pairs = db.session.execute(
-            db.select(WordPair).filter_by(card_id=card_id)
+            db.select(WordPair).filter_by(card_id=card_id).order_by(WordPair.order_index)
         ).scalars().all()
         
         for pair in word_pairs:
             pair.is_learned = False
+            # Optional: Reset study tracking as well
+            # pair.study_count = 0
+            # pair.last_studied = None
             
-        # Reset card progress
         card.progress = 0
-            
         db.session.commit()
         
-        return jsonify({
-            'message': 'Progress reset successfully',
-            'progress': 0
-        }), 200
+        # Return complete card data with consistent ordering
+        response_data = {
+            'id': card.id,
+            'title': card.title,
+            'progress': 0,
+            'targetDays': card.target_days,
+            'totalWords': len(word_pairs),
+            'learnedWords': 0,
+            'wordPairs': [{
+                'id': pair.id,
+                'english': pair.english,
+                'indonesian': pair.indonesian,
+                'isLearned': False,
+                'orderIndex': pair.order_index,
+                'studyCount': pair.study_count,
+                'lastStudied': pair.last_studied.isoformat() if pair.last_studied else None
+            } for pair in word_pairs]
+        }
+        
+        return jsonify(response_data), 200
+
     except Exception as e:
         db.session.rollback()
+        print(f"Error in reset_progress: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/cards/<int:card_id>', methods=['GET'])
@@ -504,31 +558,223 @@ def get_card_detail(current_user, card_id):
             
         card = result[0]
         
-        # Fetch all word pairs for this card
+        # Fetch all word pairs for this card, ordered by order_index
         word_pairs = db.session.execute(
-            db.select(WordPair).filter_by(card_id=card_id)
+            db.select(WordPair).filter_by(card_id=card_id).order_by(WordPair.order_index)
         ).scalars().all()
+        
+        learned_count = len([pair for pair in word_pairs if pair.is_learned])
             
         response_data = {
             'id': card.id,
             'title': card.title,
             'progress': card.progress,
             'targetDays': card.target_days,
-            'totalWords': len(word_pairs),  # Add totalWords to response
+            'totalWords': len(word_pairs),
+            'learnedWords': learned_count,
             'wordPairs': [{
+                'id': pair.id,
                 'english': pair.english,
-                'indonesian': pair.indonesian
+                'indonesian': pair.indonesian,
+                'isLearned': pair.is_learned,
+                'orderIndex': pair.order_index,
+                'studyCount': pair.study_count,
+                'lastStudied': pair.last_studied.isoformat() if pair.last_studied else None
             } for pair in word_pairs]
         }
         
         return jsonify(response_data), 200
     except Exception as e:
         print(f"Error in get_card_detail: {str(e)}")
-        return jsonify({'error': f'Server error: {str(e)}'}), 500    
+        return jsonify({'error': str(e)}), 500
+
+# New endpoint to mark individual word as learned/unlearned
+@app.route('/api/cards/<int:card_id>/words/<int:word_id>/toggle', methods=['PUT'])
+@token_required
+def toggle_word_learned(current_user, card_id, word_id):
+    try:
+        # Verify card belongs to user
+        card_result = db.session.execute(
+            db.select(LearningCard).filter_by(id=card_id, user_id=current_user.id)
+        ).first()
+        
+        if not card_result:
+            return jsonify({'error': 'Card not found'}), 404
+            
+        card = card_result[0]
+        
+        # Get the specific word pair
+        word_result = db.session.execute(
+            db.select(WordPair).filter_by(id=word_id, card_id=card_id)
+        ).first()
+        
+        if not word_result:
+            return jsonify({'error': 'Word pair not found'}), 404
+            
+        word_pair = word_result[0]
+        
+        # Toggle learned status
+        word_pair.is_learned = not word_pair.is_learned
+        word_pair.study_count += 1
+        word_pair.last_studied = datetime.utcnow()
+        
+        # Recalculate card progress
+        all_pairs = db.session.execute(
+            db.select(WordPair).filter_by(card_id=card_id)
+        ).scalars().all()
+        
+        learned_count = len([pair for pair in all_pairs if pair.is_learned])
+        total_count = len(all_pairs)
+        
+        if total_count > 0:
+            card.progress = min(round((learned_count / total_count) * 100), 100)
+        
+        db.session.commit()
+        
+        return jsonify({
+            'wordId': word_pair.id,
+            'isLearned': word_pair.is_learned,
+            'studyCount': word_pair.study_count,
+            'lastStudied': word_pair.last_studied.isoformat(),
+            'cardProgress': card.progress,
+            'learnedCount': learned_count,
+            'totalCount': total_count
+        }), 200
+        
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 500
+    
+# Add this endpoint to your Flask backend after the existing toggle endpoint
+
+@app.route('/api/cards/<int:card_id>/words/<int:word_id>/learned', methods=['PUT'])
+@token_required
+def set_word_learned_status(current_user, card_id, word_id):
+    try:
+        # Verify card belongs to user
+        card_result = db.session.execute(
+            db.select(LearningCard).filter_by(id=card_id, user_id=current_user.id)
+        ).first()
+        
+        if not card_result:
+            return jsonify({'error': 'Card not found'}), 404
+            
+        card = card_result[0]
+        
+        # Get the specific word pair
+        word_result = db.session.execute(
+            db.select(WordPair).filter_by(id=word_id, card_id=card_id)
+        ).first()
+        
+        if not word_result:
+            return jsonify({'error': 'Word pair not found'}), 404
+            
+        word_pair = word_result[0]
+        
+        # Get the desired learned status from request body
+        data = request.json
+        if 'isLearned' not in data:
+            return jsonify({'error': 'isLearned field is required'}), 400
+            
+        new_learned_status = bool(data['isLearned'])
+        
+        # Only update if status actually changed
+        if word_pair.is_learned != new_learned_status:
+            word_pair.is_learned = new_learned_status
+            word_pair.study_count += 1
+            word_pair.last_studied = datetime.utcnow()
+        
+        # Recalculate card progress
+        all_pairs = db.session.execute(
+            db.select(WordPair).filter_by(card_id=card_id)
+        ).scalars().all()
+        
+        learned_count = len([pair for pair in all_pairs if pair.is_learned])
+        total_count = len(all_pairs)
+        
+        if total_count > 0:
+            card.progress = min(round((learned_count / total_count) * 100), 100)
+        
+        db.session.commit()
+        
+        return jsonify({
+            'wordId': word_pair.id,
+            'isLearned': word_pair.is_learned,
+            'studyCount': word_pair.study_count,
+            'lastStudied': word_pair.last_studied.isoformat(),
+            'cardProgress': card.progress,
+            'learnedCount': learned_count,
+            'totalCount': total_count
+        }), 200
+        
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 500
+
+# Get learning statistics for a card
+@app.route('/api/cards/<int:card_id>/stats', methods=['GET'])
+@token_required
+def get_card_stats(current_user, card_id):
+    try:
+        # Verify card belongs to user
+        card_result = db.session.execute(
+            db.select(LearningCard).filter_by(id=card_id, user_id=current_user.id)
+        ).first()
+        
+        if not card_result:
+            return jsonify({'error': 'Card not found'}), 404
+            
+        card = card_result[0]
+        
+        # Get all word pairs
+        word_pairs = db.session.execute(
+            db.select(WordPair).filter_by(card_id=card_id).order_by(WordPair.order_index)
+        ).scalars().all()
+        
+        learned_words = [pair for pair in word_pairs if pair.is_learned]
+        unlearned_words = [pair for pair in word_pairs if not pair.is_learned]
+        
+        # Calculate statistics
+        total_study_sessions = sum(pair.study_count for pair in word_pairs)
+        most_studied = max(word_pairs, key=lambda x: x.study_count) if word_pairs else None
+        least_studied = min(word_pairs, key=lambda x: x.study_count) if word_pairs else None
+        
+        # Recent study activity (last 7 days)
+        week_ago = datetime.utcnow() - timedelta(days=7)
+        recently_studied = [
+            pair for pair in word_pairs 
+            if pair.last_studied and pair.last_studied > week_ago
+        ]
+        
+        stats = {
+            'cardId': card.id,
+            'title': card.title,
+            'totalWords': len(word_pairs),
+            'learnedWords': len(learned_words),
+            'unlearnedWords': len(unlearned_words),
+            'progressPercentage': card.progress,
+            'totalStudySessions': total_study_sessions,
+            'recentlyStudiedCount': len(recently_studied),
+            'mostStudiedWord': {
+                'english': most_studied.english,
+                'indonesian': most_studied.indonesian,
+                'studyCount': most_studied.study_count
+            } if most_studied and most_studied.study_count > 0 else None,
+            'leastStudiedWord': {
+                'english': least_studied.english,
+                'indonesian': least_studied.indonesian,
+                'studyCount': least_studied.study_count
+            } if least_studied else None,
+            'averageStudyCount': round(total_study_sessions / len(word_pairs), 2) if word_pairs else 0
+        }
+        
+        return jsonify(stats), 200
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 with app.app_context():
     db.create_all()
-
 
 if __name__ == '__main__':
     app.run()
